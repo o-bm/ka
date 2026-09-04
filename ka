@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# ka - keep tmux sessions alive by sending Enter on an interval.
+#
+#   ka continue <session> [interval]   start sending Enter (default every 3s)
+#   ka stop <session>|all              stop the loop for one session or all
+#   ka status                          list sessions currently being kept alive
+set -euo pipefail
+
+RUN_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/ka"
+mkdir -p "$RUN_DIR"
+
+usage() { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+session_exists() { tmux has-session -t "=$1" 2>/dev/null; }
+
+list_sessions() { tmux ls -F '#S' 2>/dev/null | tr '\n' ' '; }
+
+loop_alive() {          # $1 = session ; prints pid if the loop is running
+  local pidfile="$RUN_DIR/$1.pid" pid
+  [[ -f $pidfile ]] || return 1
+  pid=$(<"$pidfile")
+  if kill -0 "$pid" 2>/dev/null; then echo "$pid"; return 0; fi
+  rm -f "$pidfile"; return 1
+}
+
+run_loop() {            # internal: $1 = session, $2 = interval
+  local s=$1 iv=$2
+  local pidfile="$RUN_DIR/$s.pid"
+  echo $$ > "$pidfile"
+  cleanup() { [[ $(<"$pidfile" 2>/dev/null) == "$$" ]] && rm -f "$pidfile"; }
+  trap 'kill "${sleeper:-}" 2>/dev/null; cleanup; exit 0' TERM INT
+  while session_exists "$s"; do
+    tmux send-keys -t "=$s:." Enter 2>/dev/null || break
+    sleep "$iv" & sleeper=$!; wait "$sleeper" || true
+  done
+  cleanup
+}
+
+cmd_continue() {
+  local s=${1:-} iv=${2:-3} pid
+  [[ -n $s ]] || usage
+  [[ $iv =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "ka: bad interval '$iv'" >&2; exit 1; }
+  if ! session_exists "$s"; then
+    echo "ka: no tmux session '$s'. Available: $(list_sessions)" >&2; exit 1
+  fi
+  if pid=$(loop_alive "$s"); then
+    echo "ka: already keeping '$s' alive (pid $pid)"; exit 0
+  fi
+  setsid nohup "$0" __loop "$s" "$iv" >/dev/null 2>&1 &
+  for _ in 1 2 3 4 5 6 7 8 9 10; do pid=$(loop_alive "$s") && break; sleep 0.1; done
+  echo "ka: sending Enter to '$s' every ${iv}s (pid ${pid:-?})"
+}
+
+cmd_stop() {
+  local s=${1:-} pid f
+  [[ -n $s ]] || usage
+  if [[ $s == all ]]; then
+    for f in "$RUN_DIR"/*.pid; do [[ -e $f ]] && cmd_stop "$(basename "${f%.pid}")"; done
+    return 0
+  fi
+  if pid=$(loop_alive "$s"); then
+    kill "$pid" 2>/dev/null || true
+    rm -f "$RUN_DIR/$s.pid"
+    echo "ka: stopped keeping '$s' alive"
+  else
+    echo "ka: '$s' was not being kept alive"
+  fi
+}
+
+cmd_status() {
+  local f s pid any=0
+  for f in "$RUN_DIR"/*.pid; do
+    [[ -e $f ]] || continue
+    s=$(basename "${f%.pid}")
+    if pid=$(loop_alive "$s"); then echo "$s (pid $pid)"; any=1; fi
+  done
+  (( any )) || echo "ka: nothing is being kept alive"
+}
+
+case "${1:-}" in
+  continue|c|start) shift; cmd_continue "$@" ;;
+  stop|s)           shift; cmd_stop "$@" ;;
+  status|ls)        cmd_status ;;
+  __loop)           run_loop "$2" "$3" ;;
+  *)                usage ;;
+esac
